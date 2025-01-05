@@ -6,6 +6,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema.document import Document
 from get_embedding_function import get_embedding_function
 from langchain.vectorstores.chroma import Chroma
+from langchain.document_loaders import DirectoryLoader
+from langchain.document_loaders.text import TextLoader
+
 
 
 CHROMA_PATH = "chroma"
@@ -29,8 +32,15 @@ def main():
 
 
 def load_documents():
-    document_loader = PyPDFDirectoryLoader(DATA_PATH)
-    return document_loader.load()
+    documents = []
+    for root, _, files in os.walk("unit_tests"):
+        for file in files:
+            if file.endswith(".test.js"):
+                with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                    content = f.read()
+                    metadata = {"source": file}
+                    documents.append(Document(page_content=content, metadata=metadata))
+    return documents
 
 
 def split_documents(documents: list[Document]):
@@ -43,33 +53,18 @@ def split_documents(documents: list[Document]):
     return text_splitter.split_documents(documents)
 
 
-def add_to_chroma(chunks: list[Document]):
-    # Load the existing database.
-    db = Chroma(
-        persist_directory=CHROMA_PATH, embedding_function=get_embedding_function()
-    )
+def add_to_chroma(chunks):
+    db = Chroma(persist_directory=CHROMA_PATH, embedding_function=get_embedding_function())
+    chunks_with_ids = calculate_chunk_ids(chunks)  # Add unique IDs to chunks
 
-    # Calculate Page IDs.
-    chunks_with_ids = calculate_chunk_ids(chunks)
-
-    # Add or Update the documents.
-    existing_items = db.get(include=[])  # IDs are always included by default
+    # Only add chunks that are not already in the DB
+    existing_items = db.get(include=[])  
     existing_ids = set(existing_items["ids"])
-    print(f"Number of existing documents in DB: {len(existing_ids)}")
+    new_chunks = [chunk for chunk in chunks_with_ids if chunk.metadata["id"] not in existing_ids]
 
-    # Only add documents that don't exist in the DB.
-    new_chunks = []
-    for chunk in chunks_with_ids:
-        if chunk.metadata["id"] not in existing_ids:
-            new_chunks.append(chunk)
-
-    if len(new_chunks):
-        print(f"👉 Adding new documents: {len(new_chunks)}")
-        new_chunk_ids = [chunk.metadata["id"] for chunk in new_chunks]
-        db.add_documents(new_chunks, ids=new_chunk_ids)
+    if new_chunks:
+        db.add_documents(new_chunks, ids=[chunk.metadata["id"] for chunk in new_chunks])
         db.persist()
-    else:
-        print("✅ No new documents to add")
 
 
 def calculate_chunk_ids(chunks):
