@@ -28,8 +28,9 @@ def query_rag_with_workflow(query_text: str, concatenated_content: str):
     logger.info("Initializing StateGraph workflow.")
 
     # Build the workflow
-    workflow = build_workflow(concatenated_content)
+    workflow = build_workflow()
 
+    print('concatenated_content', concatenated_content)
     # Initialize state with context
     state: GraphState = {
         "error": "no",
@@ -54,8 +55,8 @@ def query_rag_with_workflow(query_text: str, concatenated_content: str):
         print(formatted_response)
         return code_solution
     else:
-        logger.error("No code solution generated.")
-        print("No solution could be generated based on the provided context.")
+        # logger.error("No code solution generated.")
+        # print("No solution could be generated based on the provided context.")
         return None
 
 def main():
@@ -68,7 +69,7 @@ def main():
     logger.info(f"Received query: {query}")
 
     # Initialize the vector store
-    db = initialize_vector_store(embedding_service="ollama")
+    db = initialize_vector_store()
 
     # Perform similarity search
     logger.info(f"Performing similarity search for query: {query}")

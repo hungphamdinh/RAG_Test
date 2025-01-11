@@ -17,3 +17,4 @@ class GraphState(TypedDict):
     messages: List
     generation: str
     iterations: int
+    context: str

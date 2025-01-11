@@ -39,7 +39,7 @@ max_iterations = 3
 flag = "do not reflect"
 
 
-def build_workflow(concatenated_content: str) -> StateGraph:
+def build_workflow() -> StateGraph:
     """
     Builds the StateGraph workflow.
 
@@ -187,9 +187,27 @@ def generate_code_solution(code_solution_response: str) -> Optional[Dict]:
     
     return code_solution_dict
 
-
-# Example usage within your generate function
 def generate(state: GraphState, code_gen_chain: LLMChain):
+    logger.info("---GENERATING CODE SOLUTION---")
+
+    messages = state["messages"]
+    iterations = state["iterations"]
+    error = state["error"]
+    concatenated_context = state.get("context", "No context provided.")  # Fetch context from state
+
+    # Serialize messages into a single string
+    serialized_messages = "\n".join([f"{role}: {content}" for role, content in messages])
+
+    code_solution_response = code_gen_chain.run({
+            "context": concatenated_context,
+            "messages": serialized_messages  # Pass serialized messages
+            # "messages": [("user", serialized_messages)]
+    })
+    print(code_solution_response)
+
+    
+# Use this when your prompt has structure {prefix, imports, code}, this one need your output always stable for working
+def generate_with_workflow(state: GraphState, code_gen_chain: LLMChain):
     logger.info("---GENERATING CODE SOLUTION---")
 
     messages = state["messages"]
@@ -207,21 +225,30 @@ def generate(state: GraphState, code_gen_chain: LLMChain):
             "messages": serialized_messages  # Pass serialized messages
             # "messages": [("user", serialized_messages)]
         })
+ 
+        prefix_pattern = r'"prefix":\s*"([^"]*)"'
 
-        # Log the raw LLM response
-        # print(f"Raw LLM Response:\n{code_solution_response}")
+    # 2️⃣ Regex pattern to extract 'imports' as a list
+        imports_pattern = r'"imports":\s*(\[[^\]]*\])'
 
-        # Extract and validate the code solution
-        code_solution_dict = generate_code_solution(code_solution_response)
+        # 3️⃣ Regex pattern to extract 'code' (multi-line string)
+        code_pattern = r'"code":\s*`([\s\S]*?)`'
 
-        parsed_data = ast.literal_eval(code_solution_dict)
+        # Extract values using regex
+        prefix_match = re.search(prefix_pattern, code_solution_response)
+        imports_match = re.search(imports_pattern, code_solution_response)
+        code_match = re.search(code_pattern, code_solution_response)
 
-        
-        if not code_solution_dict:
-            raise ValueError("Invalid code solution format received from LLM.")
+        # Extracted values or default to None
+        prefix = prefix_match.group(1) if prefix_match else None
+        imports = json.loads(imports_match.group(1)) if imports_match else None
+        code = code_match.group(1) if code_match else None
 
+        # print("Prefix:", prefix)
+        # print("Imports:", imports)
+        # print("Code:\n", code)
         # Create a CodeSolution instance
-        code_solution = CodeSolution(prefix= parsed_data['prefix'], imports= f"""{parsed_data['imports']}""", code = parsed_data['code'])
+        code_solution = CodeSolution(prefix= prefix, imports= f"""{imports}""", code = code)
 
         # Store the CodeSolution in state
         state["generation"] = code_solution
@@ -254,72 +281,72 @@ def code_check(state: GraphState) -> Dict:
     """
     logger.info("---CHECKING CODE---")
 
-    messages = state["messages"]
-    code_solution = state["generation"]
-    iterations = state["iterations"]
+    # messages = state["messages"]
+    # code_solution = state["generation"]
+    # iterations = state["iterations"]
 
-    if not isinstance(code_solution, CodeSolution):
-        logger.error("Code solution is not an instance of CodeSolution.")
-        messages += [("user", "Invalid code solution format. Cannot perform code checks.")]
-        return {
-            "generation": code_solution,
-            "messages": messages,
-            "iterations": iterations,
-            "error": "yes",
-        }
+    # if not isinstance(code_solution, CodeSolution):
+    #     logger.error("Code solution is not an instance of CodeSolution.")
+    #     messages += [("user", "Invalid code solution format. Cannot perform code checks.")]
+    #     return {
+    #         "generation": code_solution,
+    #         "messages": messages,
+    #         "iterations": iterations,
+    #         "error": "yes",
+    #     }
 
-    imports = code_solution.imports
-    code = code_solution.code
+    # imports = code_solution.imports
+    # code = code_solution.code
 
-    # Define a restricted execution environment
-    safe_globals = {}
-    safe_locals = {}
+    # # Define a restricted execution environment
+    # safe_globals = {}
+    # safe_locals = {}
 
-    # Define allowed built-ins
-    allowed_builtins = {
-        'print': print,
-        'len': len,
-        'range': range,
-        # Add other safe built-ins as needed
-    }
-    safe_globals['__builtins__'] = allowed_builtins
+    # # Define allowed built-ins
+    # allowed_builtins = {
+    #     'print': print,
+    #     'len': len,
+    #     'range': range,
+    #     # Add other safe built-ins as needed
+    # }
+    # safe_globals['__builtins__'] = allowed_builtins
 
-    # Check imports
-    try:
-        exec(imports, safe_globals, safe_locals)
-    except Exception as e:
-        logger.info("---CODE IMPORT CHECK: FAILED---")
-        error_message = [("user", f"Your solution failed the import test: {e}")]
-        messages += error_message
-        return {
-            "generation": code_solution,
-            "messages": messages,
-            "iterations": iterations,
-            "error": "yes",
-        }
+    # # Check imports
+    # try:
+    #     exec(imports, safe_globals, safe_locals)
+    # except Exception as e:
+    #     logger.info("---CODE IMPORT CHECK: FAILED---")
+    #     error_message = [("user", f"Your solution failed the import test: {e}")]
+    #     messages += error_message
+    #     return {
+    #         "generation": code_solution,
+    #         "messages": messages,
+    #         "iterations": iterations,
+    #         "error": "yes",
+    #     }
 
-    # Check execution
-    try:
-        exec(code, safe_globals, safe_locals)
-    except Exception as e:
-        logger.info("---CODE BLOCK CHECK: FAILED---")
-        error_message = [("user", f"Your solution failed the code execution test: {e}")]
-        messages += error_message
-        return {
-            "generation": code_solution,
-            "messages": messages,
-            "iterations": iterations,
-            "error": "yes",
-        }
+    # # Check execution
+    # try:
+    #     exec(code, safe_globals, safe_locals)
+    # except Exception as e:
+    #     logger.info("---CODE BLOCK CHECK: FAILED---")
+    #     error_message = [("user", f"Your solution failed the code execution test: {e}")]
+    #     messages += error_message
+    #     return {
+    #         "generation": code_solution,
+    #         "messages": messages,
+    #         "iterations": iterations,
+    #         "error": "yes",
+    #     }
 
-    # No errors
-    logger.info("---NO CODE TEST FAILURES---")
-    return {
-        "generation": code_solution,
-        "messages": messages,
-        "iterations": iterations,
-        "error": "no",
-    }
+    # # No errors
+    # logger.info("---NO CODE TEST FAILURES---")
+    # return {
+    #     "generation": code_solution,
+    #     "messages": messages,
+    #     "iterations": iterations,
+    #     "error": "no",
+    # }
 
 
 def reflect(state: GraphState) -> Dict:

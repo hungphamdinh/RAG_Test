@@ -73,7 +73,7 @@ def main():
         clear_database()
 
     # Initialize vector store
-    db = initialize_vector_store(embedding_service=args.embedding_service)
+    db = initialize_vector_store()
 
     # Load and process documents
     documents = load_documents(source_dir=args.source_dir, file_extensions=args.file_extensions)
