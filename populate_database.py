@@ -1,23 +1,20 @@
 import argparse
 import os
 import shutil
-from langchain.document_loaders.pdf import PyPDFDirectoryLoader
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema.document import Document
 from get_embedding_function import get_embedding_function
-from langchain.vectorstores.chroma import Chroma
-from langchain.document_loaders import DirectoryLoader
-from langchain.document_loaders.text import TextLoader
-
-
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders import TextLoader
 
 CHROMA_PATH = "chroma"
 DATA_PATH = "data"
 
 
 def main():
-
-    # Check if the database should be cleared (using the --clear flag).
+    # Check if the database should be cleared
     parser = argparse.ArgumentParser()
     parser.add_argument("--reset", action="store_true", help="Reset the database.")
     args = parser.parse_args()
@@ -33,13 +30,14 @@ def main():
 
 def load_documents():
     documents = []
-    for root, _, files in os.walk("unit_tests"):
+    for root, _, files in os.walk("code"):
         for file in files:
-            if file.endswith(".test.js"):
-                with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+            if file.endswith(".js"):
+                path = os.path.join(root, file)
+                with open(path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    metadata = {"source": file}
-                    documents.append(Document(page_content=content, metadata=metadata))
+                metadata = {"source": os.path.relpath(path, start=DATA_PATH)}
+                documents.append(Document(page_content=content, metadata=metadata))
     return documents
 
 
@@ -55,13 +53,15 @@ def split_documents(documents: list[Document]):
 
 def add_to_chroma(chunks):
     db = Chroma(persist_directory=CHROMA_PATH, embedding_function=get_embedding_function())
-    chunks_with_ids = calculate_chunk_ids(chunks)  # Add unique IDs to chunks
+    chunks_with_ids = calculate_chunk_ids(chunks)
 
     # Only add chunks that are not already in the DB
-    existing_items = db.get(include=[])  
-    existing_ids = set(existing_items["ids"])
+    existing = db.get(include=["metadatas"])
+    existing_ids = set()
+    for meta in existing.get("metadatas", []):
+        if isinstance(meta, dict) and "id" in meta:
+            existing_ids.add(meta["id"])
     new_chunks = [chunk for chunk in chunks_with_ids if chunk.metadata["id"] not in existing_ids]
-
     if new_chunks:
         db.add_documents(new_chunks, ids=[chunk.metadata["id"] for chunk in new_chunks])
         db.persist()
