@@ -7,6 +7,9 @@ from transformers import TextIteratorStreamer
 import threading
 from queue import Empty
 
+# Import self_amplifier for rationale generation and benchmarking
+from self_amplifier import self_amplifier
+
 import logging
 import time
 from tqdm import tqdm
@@ -414,7 +417,7 @@ def generate_context_idx(model, tokenizer_instance, df, nb_shot, selection_strat
 # ------------------------------------------------------------
 # The main RAG + Self-AMPlIFY pipeline:
 # ------------------------------------------------------------
-def query_rag(query_text: str, module: str = None):
+def query_rag(query_text: str, module: str = None, args=None):
     # Reload history
     global chat_history
     chat_history = load_history() or {}
@@ -494,44 +497,72 @@ def query_rag(query_text: str, module: str = None):
     elapsed = time.time() - start_time
     logging.info(f"   → Selected indices {shot_indices} (took {elapsed:.2f}s)")
 
-    # 7) Generate rationales for each selected example
-    logging.info("Step 5/6: Generating rationales via Captum/DeepLift")
+    # 7) Generate rationales for each selected example (supports all self_amplifier modes)
+    logging.info("Step 5/6: Generating rationales with explainer '%s'", args.explainer)
+    amp = self_amplifier(model=hf_model, tokenizer=hf_tokenizer, device=device)
+    captum_map = {
+        "deeplift": "DeepLift",
+        "ig": "LayerIntegratedGradients",
+        "grad_act": "LayerGradientXActivation",
+        "kernel_shap": "KernelShap",
+        "lime": "Lime",
+        "shap": "ShapleyValues",
+        "shap_s": "ShapleyValueSampling",
+        "random": "random"
+    }
     fewshot_strings = []
     for idx in tqdm(shot_indices, desc="Generating shot rationales"):
-        logging.info(f"   • Rationale for example #{idx}")
         ex_q = df_fewshot.at[idx, "question"]
         ex_a = df_fewshot.at[idx, "AnswerKey"]
+        logging.info("   • Example #%d: %s → %s", idx, ex_q, ex_a)
 
-        # Tokenize example question
+        # self-amplify modes
+        if args.explainer in ("self_topk", "self_exp", "auto_cot"):
+            if args.explainer == "self_topk":
+                _, idx_tensor = amp.preprocess_self_topk(ex_q, ex_a, topk=3)
+            elif args.explainer == "self_exp":
+                _, idx_tensor = amp.preprocess_self_exp(ex_q, ex_a, n_steps=3)
+            else:
+                _, idx_tensor = amp.preprocess_auto_cot(ex_q)
+            outputs = hf_model.generate(idx_tensor.to(device), max_new_tokens=300, do_sample=False, num_beams=1)
+            raw = hf_tokenizer.decode(outputs[0][idx_tensor.shape[1]:], skip_special_tokens=True).strip()
+            fewshot_strings.append(f"Q: {ex_q}\nA: {raw}")
+            continue
+
+        # Captum explainers
         _, idx_tensor, _ = preprocess(ex_q, with_bracket=True)
-
-        # Top-3 keywords via DeepLift
+        expl_name = captum_map.get(args.explainer, "DeepLift")
         start_r = time.time()
         keywords = generate_rationale(
             model=hf_model,
             tokenizer=hf_tokenizer,
             idx=idx_tensor,
             target=ex_a,
-            explainer="DeepLift",
+            explainer=expl_name,
             topk_words=3
         )
         elapsed_r = time.time() - start_r
-        logging.info(f"     – Keywords = {keywords} (took {elapsed_r:.2f}s)")
-
-        # Format as "Q: ...  A: The 3 keywords 'X', 'Y', and 'Z' are important to predict ..."
-        kw_str = ""
-        for i, w in enumerate(keywords):
-            w_clean = w.replace(".", "").strip()
-            if i == len(keywords) - 1:
-                kw_str += "and " + f"'{w_clean}'"
-            else:
-                kw_str += f"'{w_clean}', "
-
-        rationale_line = (
-            f"Q: {ex_q}\n"
-            f"A: The 3 keywords {kw_str} are important to predict that the answer is ({ex_a})."
+        logging.info("     – %s keywords = %s (%.2fs)", expl_name, keywords, elapsed_r)
+        kw_str = ", ".join(f"'{w.strip()}'" for w in keywords[:-1]) + " and " + f"'{keywords[-1].strip()}'"
+        fewshot_strings.append(
+            f"Q: {ex_q}\nA: The 3 keywords {kw_str} are important to predict that the answer is ({ex_a})."
         )
-        fewshot_strings.append(rationale_line)
+
+    # Optional benchmarking
+    if args.benchmark:
+        logging.info("Running benchmark (evaluate_fs_with_exp)...")
+        df_test = pd.read_csv("fewshot_test.csv")
+        bench = amp.evaluate_fs_with_exp(
+            df_train=df_fewshot,
+            df_test=df_test,
+            model=hf_model,
+            max_new_tokens=1,
+            explainer=captum_map.get(args.explainer, "DeepLift"),
+            idx_list_fs=shot_indices,
+            topk_words=3,
+            split_dict=None
+        )
+        print(bench)
 
     # 8) Construct final prompt for Llama2, embedding Mistral rationales directly
     prompt = (
@@ -580,6 +611,21 @@ def main():
         default="mmr",
         help="Choose retrieval method: 'mmr' or 'similarity'."
     )
+    parser.add_argument(
+        "--explainer",
+        choices=[
+            "deeplift", "ig", "grad_act",
+            "kernel_shap", "lime", "shap", "shap_s",
+            "self_topk", "self_exp", "auto_cot", "random"
+        ],
+        default="deeplift",
+        help="Which explanation strategy to use for few-shot rationales"
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="If set, run evaluate_fs_with_exp to benchmark on a test set"
+    )
     args = parser.parse_args()
 
     global CURRENT_MODULE, RETRIEVAL_METHOD, chat_history
@@ -593,7 +639,7 @@ def main():
 
     query_text = args.query_text
     add_to_history("User", query_text)
-    _ = query_rag(query_text, args.module)
+    _ = query_rag(query_text, args.module, args=args)
 
     save_input = input("Store this conversation to memory? (y/n): ").strip().lower()
     if save_input.startswith("y"):
@@ -603,3 +649,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
