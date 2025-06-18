@@ -84,11 +84,15 @@ def preprocess(prompt: str, with_bracket: bool = True):
     Mistral outputs a single-letter answer (e.g. "A").
     """
     if with_bracket:
-        # Use Mistral’s chat template: [INST]\n<question></s>
-        formatted = f"[INST]\n{prompt}</s>"
+        # Wrap the question and inject an assistant prefix so Mistral will output a single-letter answer
+        formatted = (
+            f"[INST]\n{prompt}[/INST]\n"
+            "Please choose ONE of the following options (A, B, C, or D) and respond with that letter only.\n"
+            "The answer is ("
+        )
     else:
         formatted = prompt
-    enc = hf_tokenizer(formatted, return_tensors="pt", padding=False)
+    enc = hf_tokenizer(formatted, return_tensors="pt", padding=False, add_special_tokens=False)
     idx_tensor = enc["input_ids"].to(device)
     attn_mask = enc["attention_mask"].to(device)
     return formatted, idx_tensor, attn_mask
@@ -171,6 +175,9 @@ def generate_rationale(model, tokenizer, idx, target, explainer, topk_words):
         if input_ids[i : i + len(start_tok)] == start_tok:
             index_min = i + len(start_tok)
             break
+    # Fallback if start token not found
+    if index_min is None:
+        index_min = 0
 
     # find index_max (just before "</s>")
     index_max = None
@@ -178,6 +185,9 @@ def generate_rationale(model, tokenizer, idx, target, explainer, topk_words):
         if input_ids[j : j + len(end_tok)] == end_tok:
             index_max = j - 1
             break
+    # Fallback if end token not found
+    if index_max is None:
+        index_max = len(input_ids) - 1
 
     # 2) Create a baseline by replacing [index_min:index_max] tokens with pad_id
     baseline = idx.clone()
@@ -298,9 +308,7 @@ MODULE_CONTEXTS = {
     """.strip(),
     "Booking": """
     Module: Booking
-    - Hooks: useBooking provides createBooking, cancelBooking.
-    - Services: bookingService.create, bookingService.search.
-    - Utils: formatDate, calculateDepositPrice in bookingHelpers.
+    - All API handling related with Booking resides in the `useBooking` hook under `Context/Booking/Hooks`.
     """.strip(),
     # Add more modules as needed
 }
@@ -477,12 +485,28 @@ def query_rag(query_text: str, module: str = None, args=None):
     conversation = "\n".join(f"{e['speaker']}: {e['text']}" for e in filtered)
     module_ctx = MODULE_CONTEXTS.get(module, "")
 
-    # 5) Prepare few-shot DataFrame (must match exactly Mistral's output format)
+    # 5) Prepare simplified few-shot DataFrame with letter keys
     df_fewshot = pd.DataFrame([
-        {"question": "Which planet is known as the Red Planet?", "AnswerKey": "A"},
-        {"question": "When did the Berlin Wall fall?",        "AnswerKey": "B"},
-        {"question": "Who wrote 'Pride and Prejudice'?",      "AnswerKey": "C"},
+        {"question": "List all API handling functions in the TaskManagement module", "AnswerKey": "A"},
+        {"question": "List all API handling functions in the Booking module",        "AnswerKey": "B"},
+        {"question": "List all API handling functions in the Feedback module",       "AnswerKey": "C"},
+        {"question": "List all API handling functions in the File module",           "AnswerKey": "D"},
     ])
+    # Map letters to full handler lists
+    fewshot_map = {
+        "A": "getTaskList, getPriorityList, getTeamsByTenant, getCurrentTeamList, "
+             "getAssigneeList, getUsersInTeamByTenants, getTaskDetail, addTask, "
+             "updateTask, getStatusList, getMentionUsers, addComment, getCommentByTask, "
+             "getEmployeesByTenant, getTeamsForTaskDetail, getTenantsTaskDetail",
+        "B": "getBookingStatus, filterBookings, getAllTimeSlots, getBookingDetail, "
+             "getPaymentStatus, addBooking, updateBooking, validateRecurringBooking, "
+             "recurringBooking, getAmenityDetail, getAmenities, getBookingPurpose",
+        "C": "getListFB, getListQRFeedback, addFB, editFB, editQrFB, detailFB, detailQRFeedback, "
+             "getSources, getAreas, getCategories, getTypes, getSubCategories, addQuickJR, "
+             "getQuickJRSetting, getFeedbackStatus, getLocations, getFeedbackDivision, getQrFeedbackSetting",
+        "D": "downloadAndViewDocument, uploadFiles, deleteFile, downloadImage, getFileReference, "
+             "getFileByGuid, getFileByReferenceId, getByReferenceIdAndModuleNames, resetFiles",
+    }
 
     # 6) Select few-shot examples (e.g. those Mistral got wrong)
     logging.info("Step 4/6: Selecting few-shot examples with Mistral-3B")
@@ -492,8 +516,19 @@ def query_rag(query_text: str, module: str = None, args=None):
         tokenizer_instance=hf_tokenizer,
         df=df_fewshot,
         nb_shot=3,
-        selection_strategy="random"
+        selection_strategy="error"
     )
+    # If no (or too few) error-based shots were found, fall back to random selection
+    if len(shot_indices) < 3:
+        logging.warning(f"Only found {len(shot_indices)} error examples; falling back to random selection")
+        shot_indices = generate_context_idx(
+            model=hf_model,
+            tokenizer_instance=hf_tokenizer,
+            df=df_fewshot,
+            nb_shot=3,
+            selection_strategy="random"
+        )
+        logging.info(f"   → Fallback selected indices {shot_indices}")
     elapsed = time.time() - start_time
     logging.info(f"   → Selected indices {shot_indices} (took {elapsed:.2f}s)")
 
@@ -514,7 +549,7 @@ def query_rag(query_text: str, module: str = None, args=None):
     for idx in tqdm(shot_indices, desc="Generating shot rationales"):
         ex_q = df_fewshot.at[idx, "question"]
         ex_a = df_fewshot.at[idx, "AnswerKey"]
-        logging.info("   • Example #%d: %s → %s", idx, ex_q, ex_a)
+        logging.info("   • Example #%d: %s → key %s", idx, ex_q, ex_a)
 
         # self-amplify modes
         if args.explainer in ("self_topk", "self_exp", "auto_cot"):
@@ -524,13 +559,23 @@ def query_rag(query_text: str, module: str = None, args=None):
                 _, idx_tensor = amp.preprocess_self_exp(ex_q, ex_a, n_steps=3)
             else:
                 _, idx_tensor = amp.preprocess_auto_cot(ex_q)
-            outputs = hf_model.generate(idx_tensor.to(device), max_new_tokens=300, do_sample=False, num_beams=1)
+            # Move inputs to same device as hf_model
+            target_device = next(hf_model.parameters()).device
+            outputs = hf_model.generate(
+                idx_tensor.to(target_device),
+                max_new_tokens=300,
+                do_sample=False,
+                num_beams=1
+            )
             raw = hf_tokenizer.decode(outputs[0][idx_tensor.shape[1]:], skip_special_tokens=True).strip()
-            fewshot_strings.append(f"Q: {ex_q}\nA: {raw}")
+            # map simple key to full list
+            letter = raw
+            full_answer = fewshot_map.get(letter, raw)
+            fewshot_strings.append(f"Q: {ex_q}\nA: {full_answer}")
             continue
 
-        # Captum explainers
-        _, idx_tensor, _ = preprocess(ex_q, with_bracket=True)
+        # Captum explainers (exclude instructional text from attribution)
+        _, idx_tensor, _ = preprocess(ex_q, with_bracket=False)
         expl_name = captum_map.get(args.explainer, "DeepLift")
         start_r = time.time()
         keywords = generate_rationale(
@@ -543,9 +588,15 @@ def query_rag(query_text: str, module: str = None, args=None):
         )
         elapsed_r = time.time() - start_r
         logging.info("     – %s keywords = %s (%.2fs)", expl_name, keywords, elapsed_r)
+        # build rationale string
         kw_str = ", ".join(f"'{w.strip()}'" for w in keywords[:-1]) + " and " + f"'{keywords[-1].strip()}'"
+        # map letter key to full list
+        letter = ex_a
+        full_answer = fewshot_map.get(letter, letter)
         fewshot_strings.append(
-            f"Q: {ex_q}\nA: The 3 keywords {kw_str} are important to predict that the answer is ({ex_a})."
+            f"Q: {ex_q}\n"
+            f"A: The 3 keywords {kw_str} are important to predict that the answer is ({letter}); "
+            f"the full handler list is: {full_answer}."
         )
 
     # Optional benchmarking
@@ -590,10 +641,10 @@ def query_rag(query_text: str, module: str = None, args=None):
     logging.info(f"   → Prompt length: {token_count} tokens")
 
     # Invoke Llama-2 for the final answer
-    logging.info("   → Invoking Llama-2 to generate final answer")
-    llama = Ollama(model="llama2:7b")
+    logging.info("   → Invoking mistral to generate final answer")
+    llama = Ollama(model="mistral:7b")
     response_text = llama.invoke(prompt)
-    logging.info("   → Llama-2 final answer generated")
+    logging.info("   → mistral final answer generated")
 
     add_to_history("Assistant", response_text)
     sources = [d.metadata.get("id") for d, _ in results]
