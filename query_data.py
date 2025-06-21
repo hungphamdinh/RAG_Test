@@ -1,287 +1,33 @@
 import pandas as pd
 import argparse
-import json
-from langchain.vectorstores.chroma import Chroma
 from langchain_community.llms.ollama import Ollama
-from transformers import TextIteratorStreamer
-import threading
-from queue import Empty
-
-# Import self_amplifier for rationale generation and benchmarking
+from utils.query_utils import QueryRewriter, CrossEncoderRanker
 from self_amplifier import self_amplifier
-
+from constant.constant import CHROMA_PATH, RETRIEVAL_METHOD
+from utils.history_utils import load_history, save_history, add_to_history, delete_history_entry
 import logging
 import time
-from tqdm import tqdm
+
+from get_embedding_function import get_embedding_function
+from src.self_amplify.self_amplify import SelfAmplify
+
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
     level=logging.INFO,
 )
 
-import re
-import os
-import uuid
-from datetime import datetime
-
-from get_embedding_function import get_embedding_function
-import torch
-from transformers import (
-    T5ForConditionalGeneration,
-    T5Tokenizer,
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    AutoModelForCausalLM
-)
-
-# For post hoc explanations:
-import numpy as np
-from captum.attr import DeepLift, LayerDeepLift, KernelShap, LLMAttribution, TextTemplateInput
-import torch.nn as nn
-
-class CustomWrapper(nn.Module):
-    def __init__(self, model):
-        super(CustomWrapper, self).__init__()
-        self.model = model
-
-    def forward(self, x):
-        # Return logits for the last token
-        return self.model(x).logits[:, -1, :]
-    
-# Device setup (use MPS on Mac if available)
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-# ------------------------------------------------------------
-# Tokenizer & Model loading
-# ------------------------------------------------------------
-# Query Rewriter uses Flan-T5
-tokenizer_t5 = T5Tokenizer.from_pretrained("google/flan-t5-small")
-model_t5     = T5ForConditionalGeneration.from_pretrained("google/flan-t5-small")
-model_t5.to(device)
-
-# Cross-Encoder reranker (MonoT5 or similar)
-# We'll pass its tokenizer into CrossEncoderRanker
-# (AutoTokenizer & AutoModelForSequenceClassification as needed later)
-
-# Hugging Face Mistral 7B (instruction-tuned variant) for few-shot selection & rationale
-HF_MISTRAL_REPO = "ministral/Ministral-3b-instruct"
-hf_tokenizer     = AutoTokenizer.from_pretrained(HF_MISTRAL_REPO)
-hf_model = AutoModelForCausalLM.from_pretrained(
-    HF_MISTRAL_REPO,
-    low_cpu_mem_usage=True,
-    device_map="cpu"
-)
-# hf_model         = AutoModelForCausalLM.from_pretrained(HF_MISTRAL_REPO, low_cpu_mem_usage=True).to(device)
-
-# ------------------------------------------------------------
-# Preprocessing helper (standalone, replicates self_amplifier.preprocess logic)
-# ------------------------------------------------------------
-def preprocess(prompt: str, with_bracket: bool = True):
-    """
-    Take a raw question string and return (prompt_str, idx_tensor),
-    where idx_tensor is what Mistral expects to generate the next token.
-    If with_bracket=True, we wrap the prompt with [INST]... </s> so that
-    Mistral outputs a single-letter answer (e.g. "A").
-    """
-    if with_bracket:
-        # Wrap the question and inject an assistant prefix so Mistral will output a single-letter answer
-        formatted = (
-            f"[INST]\n{prompt}[/INST]\n"
-            "Please choose ONE of the following options (A, B, C, or D) and respond with that letter only.\n"
-            "The answer is ("
-        )
-    else:
-        formatted = prompt
-    enc = hf_tokenizer(formatted, return_tensors="pt", padding=False, add_special_tokens=False)
-    idx_tensor = enc["input_ids"].to(device)
-    attn_mask = enc["attention_mask"].to(device)
-    return formatted, idx_tensor, attn_mask
-
-# ------------------------------------------------------------
-# QueryRewriter and CrossEncoderRanker (unchanged except naming)
-# ------------------------------------------------------------
-class QueryRewriter:
-    """
-    Rewrite or expand the raw user query using Flan-T5.
-    """
-    def __init__(self, model_name: str):
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
-        self.model     = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
-
-    def rewrite(self, query: str) -> str:
-        inputs = self.tokenizer(
-            query,
-            return_tensors="pt",
-            truncation=True,
-            padding="longest"
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        generated = self.model.generate(
-            **inputs, max_length=64, num_beams=5, early_stopping=True
-        )
-        return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+_llama_client = None
+def get_llama_client():
+    global _llama_client
+    if _llama_client is None:
+        _llama_client = Ollama(model="mistral:7b")
+    return _llama_client
 
 
-class CrossEncoderRanker:
-    """
-    Rerank a list of passages by relevance to the query using a cross-encoder.
-    """
-    def __init__(self, model_name: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model     = AutoModelForSequenceClassification.from_pretrained(model_name).to(device)
-
-    def rerank(self, query: str, passages: list[str]) -> list[str]:
-        if not passages:
-            return []
-        enc = self.tokenizer(
-            [query] * len(passages),
-            passages,
-            truncation=True,
-            padding=True,
-            return_tensors="pt"
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
-        with torch.no_grad():
-            logits = self.model(**enc).logits
-            if logits.size(1) == 2:
-                scores = logits[:, 1].cpu().numpy()
-            else:
-                scores = logits.squeeze(-1).cpu().numpy()
-        ranked = sorted(zip(passages, scores), key=lambda x: -x[1])
-        return [p for p, _ in ranked]
-
-# ------------------------------------------------------------
-# Helper: Generate top-k keyword rationale via DeepLift or KernelShap
-# ------------------------------------------------------------
-def generate_rationale(model, tokenizer, idx, target, explainer, topk_words):
-    """
-    Use Captum's DeepLift or KernelShap to compute token attributions for the
-    final token's logit, aggregate to word level, and return the topk words.
-    - model: a Hugging Face CausalLM with .forward() returning logits
-    - tokenizer: matching tokenizer for that model
-    - idx: a (1 x seq_len) tensor, input_ids already on device
-    - target: the single-token string label (e.g. "A")
-    - explainer: "DeepLift" or "KernelShap"
-    - topk_words: number of keywords to return
-    """
-    # 1) Identify question span: everything between "[INST]\n" and "</s>"
-    input_ids = idx[0].tolist()
-    start_tok = tokenizer.encode("[INST]\n", add_special_tokens=False)
-    end_tok   = tokenizer.encode("</s>", add_special_tokens=False)
-
-    # find index_min
-    index_min = None
-    for i in range(len(input_ids) - len(start_tok) + 1):
-        if input_ids[i : i + len(start_tok)] == start_tok:
-            index_min = i + len(start_tok)
-            break
-    # Fallback if start token not found
-    if index_min is None:
-        index_min = 0
-
-    # find index_max (just before "</s>")
-    index_max = None
-    for j in range(index_min, len(input_ids) - len(end_tok) + 1):
-        if input_ids[j : j + len(end_tok)] == end_tok:
-            index_max = j - 1
-            break
-    # Fallback if end token not found
-    if index_max is None:
-        index_max = len(input_ids) - 1
-
-    # 2) Create a baseline by replacing [index_min:index_max] tokens with pad_id
-    baseline = idx.clone()
-    pad_id = tokenizer.pad_token_id
-    baseline[0, index_min : index_max + 1] = pad_id
-
-    # 3) Define forward function that returns last-token logits
-    def forward_fn(input_ids_tensor):
-        out = model(input_ids_tensor.to(model.device))
-        # return shape: (batch, vocab_size) for the final position
-        return out.logits[:, -1, :]
-
-
-    if explainer == "DeepLift":
-        # Wrap the model so that it returns next-token logits
-        wrapper = CustomWrapper(model)
-        # Use LayerDeepLift with the wrapper and embedding layer
-        lfi = LayerDeepLift(wrapper, model.get_input_embeddings())
-        attr = lfi.attribute(
-            inputs=idx.to(model.device),
-            baselines=baseline.to(model.device),
-            target=tokenizer.encode(target, add_special_tokens=False)[0],
-        )
-
-        # 4) Sum over embedding dim → get shape (1, seq_len)
-        attributions = attr.sum(dim=2).detach().cpu().numpy()[0, index_min : index_max + 1]
-        attributions = attributions / (np.sum(attributions) + 1e-12)
-
-        # 5) Map subtokens to decoded words
-        subtokens = [tokenizer.decode([tid]).strip() for tid in input_ids[index_min : index_max + 1]]
-        decoded_words = tokenizer.decode(idx[0, index_min : index_max + 1]).split()
-
-        word_attribs = []
-        k = 0
-        buffer = ""
-        accum = 0.0
-        for subidx, subtoken in enumerate(subtokens):
-            buffer += subtoken.replace(" ", "")
-            accum += attributions[subidx]
-            if buffer == decoded_words[k]:
-                # Zero out if stopword
-                if decoded_words[k].lower() in {"the", "a", "to", "is", "of", "on", "in", "and"}:
-                    accum = 0.0
-                word_attribs.append((decoded_words[k], accum))
-                k += 1
-                buffer = ""
-                accum = 0.0
-
-        # 6) Pick top-k words by descending attribution
-        word_attribs.sort(key=lambda x: -x[1])
-        topk_words_list = [w for w, _ in word_attribs[:topk_words]]
-        return topk_words_list
-
-    elif explainer == "KernelShap":
-        ks = KernelShap(forward_fn)
-
-        # Build a template: replace each word in the question with "{}"
-        question_text = tokenizer.decode(idx[0, index_min : index_max + 1])
-        words = question_text.split()
-        placeholder = " ".join(["{}"] * len(words))
-        full_prompt = tokenizer.decode(idx[0])
-        template = full_prompt.replace(question_text, placeholder)
-
-        inp = TextTemplateInput(template=template, values=words)
-        attr_res = LLMAttribution(ks, tokenizer).attribute(inp, **{"n_samples": 64})
-
-        word_attrs = np.array(attr_res.seq_attr)
-        tokens_clean = words
-        attrs_clean  = word_attrs
-
-        # Zero out stopwords
-        stopwords = {"the", "a", "to", "is", "of", "on", "in", "and"}
-        for i, w in enumerate(tokens_clean):
-            if w.lower() in stopwords:
-                attrs_clean[i] = 0.0
-
-        topk_idx = np.argpartition(-attrs_clean, topk_words)[:topk_words]
-        topk_words_list = [tokens_clean[i] for i in sorted(topk_idx)]
-        return topk_words_list
-
-    else:
-        raise ValueError(f"Unsupported explainer: {explainer}")
-
-
-# ------------------------------------------------------------
-# In-memory chat history utilities
-# ------------------------------------------------------------
+self_amp = SelfAmplify()
 CURRENT_MODULE = None
 chat_history   = {}
-CHROMA_PATH    = "chroma"
-CONFIG_PATH    = ".rag_config.json"
-MEMORY_PATH    = "memory"
-HISTORY_FILE   = os.path.join(MEMORY_PATH, "history.json")
-RETRIEVAL_METHOD = "mmr"
 GENERAL_CONTEXT = """
 You are a master of React Native and JavaScript, with the expertise of a senior Technical Architect.
 You know every detail of this codebase. Your mission is to assist the user by explaining any part they don’t understand.
@@ -312,341 +58,139 @@ MODULE_CONTEXTS = {
     """.strip(),
     # Add more modules as needed
 }
-
-
-def load_history():
-    """Load chat history from disk if available."""
-    try:
-        with open(HISTORY_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_history():
-    """Persist chat history to disk."""
-    os.makedirs(MEMORY_PATH, exist_ok=True)
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(chat_history, f, indent=2)
-
-
-def add_to_history(speaker: str, text: str):
-    """Append a speaker’s message to history with a unique key."""
-    key = str(uuid.uuid4())
-    chat_history[key] = {
-        "speaker": speaker,
-        "text": text,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "module": CURRENT_MODULE
-    }
-
-
-def delete_history_entry(key: str):
-    """Remove a history entry by its unique key."""
-    if key in chat_history:
-        del chat_history[key]
-    else:
-        print(f"No history entry found for key: {key}")
-
-
-# ------------------------------------------------------------
-# Few-shot selection: pick indices based on success/error/random
-# ------------------------------------------------------------
-def generate_context_idx(model, tokenizer_instance, df, nb_shot, selection_strategy):
-    """
-    Select `nb_shot` examples from `df` such that either:
-      - 'error': model’s single-token answer != df.AnswerKey AND answer in answer_keys
-      - 'success': model’s single-token answer == df.AnswerKey
-      - 'random': random sample
-    Returns a list of integer indices from df.index.
-    """
-    shot_list = []
-    examples_found = 0
-    answer_keys = np.sort(df["AnswerKey"].unique()).tolist()
-    attempts = 0
-
-    logging.info(f"→ Starting few-shot selection (need {nb_shot} examples).")
-    while examples_found < nb_shot:
-        attempts += 1
-        if attempts % 5 == 0:
-            logging.info(f"   Checked {attempts} candidates so far, found {examples_found} valid shots.")
-
-        # Sample a random example not already chosen
-        i = df[df.index.isin(shot_list) == False].sample(n=1, replace=True).index[0]
-        prompt = df.at[i, "question"]
-        target = df.at[i, "AnswerKey"]
-
-        # Tokenize example question for Mistral
-        _, idx_tensor, attn_mask = preprocess(prompt, with_bracket=True)
-        len_input = idx_tensor.shape[1]
-
-        # Generate exactly one token (the letter) using greedy decode (1 beam)
-        t0 = time.time()
-        outputs = model.generate(
-            input_ids=idx_tensor.to(model.device),
-            attention_mask=attn_mask.to(model.device),
-            max_new_tokens=1,
-            pad_token_id=hf_tokenizer.eos_token_id,
-            do_sample=False,
-            num_beams=1
-        )
-        t1 = time.time()
-        logging.info(f"     → Iteration {attempts}: generate() took {(t1 - t0):.2f}s")
-
-        answer = tokenizer_instance.decode(
-            outputs[0][len_input :], skip_special_tokens=True
-        ).upper()
-
-        # Check selection criteria
-        if selection_strategy == "error":
-            if (target != answer) and (answer in answer_keys):
-                shot_list.append(i)
-                examples_found += 1
-                logging.info(f"       • Chose index {i} (prompt ‘{prompt}’ → ‘{answer}’).")
-        elif selection_strategy == "success":
-            if (target == answer) and (answer in answer_keys):
-                shot_list.append(i)
-                examples_found += 1
-        elif selection_strategy == "random":
-            shot_list = df.sample(n=nb_shot, replace=True).index.tolist()
-            examples_found = nb_shot
-        else:
-            break
-
-        # Prevent infinite loops
-        if attempts >= 50 and examples_found < nb_shot:
-            logging.warning(f"   → Stopped after {attempts} attempts; only {examples_found} examples found.")
-            break
-
-    logging.info(f"→ Finished few-shot selection: picked indices {shot_list} after {attempts} attempts.")
-    return shot_list
-
+def invoke_model(prompt: str) -> str:
+    logging.info("Step 8/8: Invoking mistral to generate final answer")
+    client = get_llama_client()
+    return client.invoke(prompt)
 
 # ------------------------------------------------------------
 # The main RAG + Self-AMPlIFY pipeline:
 # ------------------------------------------------------------
 def query_rag(query_text: str, module: str = None, args=None):
-    # Reload history
-    global chat_history
-    chat_history = load_history() or {}
+    # Step 0: Load chat history and module config
+    chat_history = self_amp.load_chat_history()
+    module = self_amp.persist_module_config(module)
 
-    # If module passed, persist it; else load previous
-    if module:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump({"module": module}, f)
-    else:
-        try:
-            module = json.load(open(CONFIG_PATH)).get("module")
-        except:
-            module = None
+    # 1) Rewrite the user query with Flan-T5 (modularized)
+    rewritten_query = self_amp.rewrite_query(query_text)
 
-    # 1) Rewrite the user query with Flan-T5
-    logging.info("Step 1/6: Rewriting query with Flan-T5")
-    start_time = time.time()
-    rewriter = QueryRewriter("google/flan-t5-small")
-    rewritten_query = rewriter.rewrite(query_text)
-    elapsed = time.time() - start_time
-    logging.info(f"   → Rewritten query = \"{rewritten_query}\"  (took {elapsed:.2f}s)")
-
-    # 2) Retrieve documents from Chroma
-    logging.info("Step 2/6: Retrieving documents from Chroma")
-    start_time = time.time()
-    embedding_function = get_embedding_function()
-    db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
-    query_embedding = embedding_function.embed_query(rewritten_query)
-
-    if RETRIEVAL_METHOD == "similarity":
-        docs = db.similarity_search_by_vector(query_embedding, k=10)
-    else:
-        docs = db.max_marginal_relevance_search_by_vector(
-            query_embedding, k=10, fetch_k=100, lambda_mult=0.7
-        )
-    elapsed = time.time() - start_time
-    logging.info(f"   → Retrieved {len(docs)} documents (took {elapsed:.2f}s)")
-
-    all_contents = [d.page_content for d in docs]
-    # 3) Rerank with CrossEncoder
-    logging.info("Step 3/6: Re-ranking with CrossEncoder")
-    start_time = time.time()
-    ranker = CrossEncoderRanker("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    top_contents = ranker.rerank(rewritten_query, all_contents)[:10]
-    docs = [d for d in docs if d.page_content in top_contents]
+    # 2 & 3) Retrieve context and rerank (modularized)
+    docs, context_text = self_amp.retrieve_context(rewritten_query, module)
     results = [(d, None) for d in docs]
-    elapsed = time.time() - start_time
-    logging.info(f"   → Reranked to top {len(docs)} docs (took {elapsed:.2f}s)")
-
-    if module:
-        results = [(d, s) for d, s in results if module in d.metadata.get("source", "")]
-
-    context_text = "\n\n---\n\n".join([d.page_content for d, _ in results])
 
     # 4) Build conversation history for this module
-    filtered = [e for e in chat_history.values() if e.get("module") == module]
-    conversation = "\n".join(f"{e['speaker']}: {e['text']}" for e in filtered)
+    conversation = self_amp.build_conversation(module)
     module_ctx = MODULE_CONTEXTS.get(module, "")
 
     # 5) Prepare simplified few-shot DataFrame with letter keys
     df_fewshot = pd.DataFrame([
         {"question": "List all API handling functions in the TaskManagement module", "AnswerKey": "A"},
-        {"question": "List all API handling functions in the Booking module",        "AnswerKey": "B"},
-        {"question": "List all API handling functions in the Feedback module",       "AnswerKey": "C"},
-        {"question": "List all API handling functions in the File module",           "AnswerKey": "D"},
+        # {"question": "List all API handling functions in the Booking module",        "AnswerKey": "B"},
+        # {"question": "List all API handling functions in the Feedback module",       "AnswerKey": "C"},
+        # {"question": "List all API handling functions in the File module",           "AnswerKey": "D"},
+        {"question": "How do I load an existing task’s data when editing?",         "AnswerKey": "E"},
+        {"question": "What’s the default shape of initialValue in TaskDetail?",     "AnswerKey": "F"},
+        {"question": "How is Yup validation configured for the task form?",         "AnswerKey": "G"},
+        {"question": "How does the code update reminders when assignees change?",    "AnswerKey": "H"},
+        {"question": "How do I fetch the task status list?", "AnswerKey": "I"},
+        {"question": "How can I retrieve the priority list for tasks?", "AnswerKey": "J"},
+        {"question": "What does getCurrentTeamList return and when should I use it?", "AnswerKey": "K"},
+        {"question": "How do I get all users across tenants in a team?", "AnswerKey": "L"},
+        {"question": "How do I get teams by tenant with error handling?", "AnswerKey": "M"},
+        {"question": "When should I use getCurrentTeamList rather than getTeamsByTenant?", "AnswerKey": "N"},
+        {"question": "How do I load assignees for a tenant?", "AnswerKey": "O"},
+        {"question": "How do I fetch all users across multiple tenants for a team?", "AnswerKey": "P"},
+        {"question": "How do I retrieve employees by tenant?", "AnswerKey": "Q"},
+        {"question": "How do I reset task detail state?", "AnswerKey": "R"},
+        {"question": "How do I fetch teams specifically for task detail view?", "AnswerKey": "S"},
+        {"question": "How do I fetch tenant list for task detail with pagination?", "AnswerKey": "T"},
+        {"question": "What happens when I tap ‘Add Sub-Task’?",                    "AnswerKey": "I"},
+        {"question": "How are task files uploaded after saving?",                  "AnswerKey": "J"},
+        {"question": "What does transformParams do before submit?",                "AnswerKey": "K"},
+        {"question": "How is the comments modal implemented?",                      "AnswerKey": "L"},
+        {"question": "How does tenant selection reset teams & assignees?",          "AnswerKey": "M"},
+        {"question": "Explain step-by-step what happens on form submit.",            "AnswerKey": "N"},
     ])
-    # Map letters to full handler lists
     fewshot_map = {
-        "A": "getTaskList, getPriorityList, getTeamsByTenant, getCurrentTeamList, "
-             "getAssigneeList, getUsersInTeamByTenants, getTaskDetail, addTask, "
-             "updateTask, getStatusList, getMentionUsers, addComment, getCommentByTask, "
-             "getEmployeesByTenant, getTeamsForTaskDetail, getTenantsTaskDetail",
-        "B": "getBookingStatus, filterBookings, getAllTimeSlots, getBookingDetail, "
-             "getPaymentStatus, addBooking, updateBooking, validateRecurringBooking, "
-             "recurringBooking, getAmenityDetail, getAmenities, getBookingPurpose",
-        "C": "getListFB, getListQRFeedback, addFB, editFB, editQrFB, detailFB, detailQRFeedback, "
-             "getSources, getAreas, getCategories, getTypes, getSubCategories, addQuickJR, "
-             "getQuickJRSetting, getFeedbackStatus, getLocations, getFeedbackDivision, getQrFeedbackSetting",
-        "D": "downloadAndViewDocument, uploadFiles, deleteFile, downloadImage, getFileReference, "
-             "getFileByGuid, getFileByReferenceId, getByReferenceIdAndModuleNames, resetFiles",
+        "A": "getTaskList, getPriorityList, getTeamsByTenant, getCurrentTeamList, getAssigneeList, getUsersInTeamByTenants, getTaskDetail, addTask, updateTask, getStatusList, getMentionUsers, addComment, getCommentByTask, getEmployeesByTenant, getTeamsForTaskDetail, getTenantsTaskDetail",
+        # "B": "getBookingStatus, filterBookings, getAllTimeSlots, getBookingDetail, getPaymentStatus, addBooking, updateBooking, validateRecurringBooking, recurringBooking, getAmenityDetail, getAmenities, getBookingPurpose",
+        # "C": "getListFB, getListQRFeedback, addFB, editFB, editQrFB, detailFB, detailQRFeedback, getSources, getAreas, getCategories, getTypes, getSubCategories, addQuickJR, getQuickJRSetting, getFeedbackStatus, getLocations, getFeedbackDivision, getQrFeedbackSetting",
+        # "D": "downloadAndViewDocument, uploadFiles, deleteFile, downloadImage, getFileReference, getFileByGuid, getFileByReferenceId, getByReferenceIdAndModuleNames, resetFiles",
+        "E": "useEffect(() => { if (isEdit) getTaskDetail(id); return () => resetTaskDetail(); }, [id]);",
+        "F": "const initialValue = { /* default field values */ };",
+        "G": "const validationSchema = Yup.object().shape({ /* shape config */ });",
+        "H": "useEffect(() => { /* sync reminder users */ }, [assignees]);",
+        "I": "useTaskManagement().getStatusList()",
+        "J": "useTaskManagement().getPriorityList()",
+        "K": "useTaskManagement().getCurrentTeamList() - returns the current user’s teams for the TaskManagement module",
+        "L": "useTaskManagement().getUsersInTeamByTenants(params)",
+        "M": "useTaskManagement().getTeamsByTenant(params)",
+        "N": "useTaskManagement().getCurrentTeamList()",
+        "O": "useTaskManagement().getAssigneeList(params)",
+        "P": "useTaskManagement().getUsersInTeamByTenants(params)",
+        "Q": "useTaskManagement().getEmployeesByTenant(params)",
+        "R": "useTaskManagement().resetTaskDetail()",
+        "S": "useTaskManagement().getTeamsForTaskDetail(params)",
+        "T": "useTaskManagement().getTenantsTaskDetail(params)",
+        "I": "const addSubTask = () => { navigation.replace('addSubTask', { /* params */ }); };",
+        "J": "const addTask = async (payload) => { /* create task then upload files */ };",
+        "K": "const params = removeUnnecessaryProperties(transformParams(payload, teamList, id));",
+        "L": "<MessageFloatingButton onPress={() => setVisible(true)} />",
+        "M": "const resetTeamAssignee = (byTeam) => { /* clear fields & refetch */ };",
+        "N": "Validate -> Show signature modal -> Transform params -> Submit request",
     }
 
     # 6) Select few-shot examples (e.g. those Mistral got wrong)
     logging.info("Step 4/6: Selecting few-shot examples with Mistral-3B")
     start_time = time.time()
-    shot_indices = generate_context_idx(
-        model=hf_model,
-        tokenizer_instance=hf_tokenizer,
-        df=df_fewshot,
-        nb_shot=3,
-        selection_strategy="error"
-    )
-    # If no (or too few) error-based shots were found, fall back to random selection
-    if len(shot_indices) < 3:
-        logging.warning(f"Only found {len(shot_indices)} error examples; falling back to random selection")
-        shot_indices = generate_context_idx(
-            model=hf_model,
-            tokenizer_instance=hf_tokenizer,
-            df=df_fewshot,
-            nb_shot=3,
-            selection_strategy="random"
-        )
-        logging.info(f"   → Fallback selected indices {shot_indices}")
+    shot_indices = self_amp.select_few_shot_indices(df_fewshot, 3, 'error')
     elapsed = time.time() - start_time
     logging.info(f"   → Selected indices {shot_indices} (took {elapsed:.2f}s)")
 
-    # 7) Generate rationales for each selected example (supports all self_amplifier modes)
+    # 7) Generate rationales for each selected example
     logging.info("Step 5/6: Generating rationales with explainer '%s'", args.explainer)
-    amp = self_amplifier(model=hf_model, tokenizer=hf_tokenizer, device=device)
-    captum_map = {
-        "deeplift": "DeepLift",
-        "ig": "LayerIntegratedGradients",
-        "grad_act": "LayerGradientXActivation",
-        "kernel_shap": "KernelShap",
-        "lime": "Lime",
-        "shap": "ShapleyValues",
-        "shap_s": "ShapleyValueSampling",
-        "random": "random"
-    }
-    fewshot_strings = []
-    for idx in tqdm(shot_indices, desc="Generating shot rationales"):
-        ex_q = df_fewshot.at[idx, "question"]
-        ex_a = df_fewshot.at[idx, "AnswerKey"]
-        logging.info("   • Example #%d: %s → key %s", idx, ex_q, ex_a)
+    fewshot_strings = self_amp.generate_few_shot_rationales(df_fewshot, shot_indices, fewshot_map, args)
 
-        # self-amplify modes
-        if args.explainer in ("self_topk", "self_exp", "auto_cot"):
-            if args.explainer == "self_topk":
-                _, idx_tensor = amp.preprocess_self_topk(ex_q, ex_a, topk=3)
-            elif args.explainer == "self_exp":
-                _, idx_tensor = amp.preprocess_self_exp(ex_q, ex_a, n_steps=3)
-            else:
-                _, idx_tensor = amp.preprocess_auto_cot(ex_q)
-            # Move inputs to same device as hf_model
-            target_device = next(hf_model.parameters()).device
-            outputs = hf_model.generate(
-                idx_tensor.to(target_device),
-                max_new_tokens=300,
-                do_sample=False,
-                num_beams=1
-            )
-            raw = hf_tokenizer.decode(outputs[0][idx_tensor.shape[1]:], skip_special_tokens=True).strip()
-            # map simple key to full list
-            letter = raw
-            full_answer = fewshot_map.get(letter, raw)
-            fewshot_strings.append(f"Q: {ex_q}\nA: {full_answer}")
-            continue
-
-        # Captum explainers (exclude instructional text from attribution)
-        _, idx_tensor, _ = preprocess(ex_q, with_bracket=False)
-        expl_name = captum_map.get(args.explainer, "DeepLift")
-        start_r = time.time()
-        keywords = generate_rationale(
-            model=hf_model,
-            tokenizer=hf_tokenizer,
-            idx=idx_tensor,
-            target=ex_a,
-            explainer=expl_name,
-            topk_words=3
-        )
-        elapsed_r = time.time() - start_r
-        logging.info("     – %s keywords = %s (%.2fs)", expl_name, keywords, elapsed_r)
-        # build rationale string
-        kw_str = ", ".join(f"'{w.strip()}'" for w in keywords[:-1]) + " and " + f"'{keywords[-1].strip()}'"
-        # map letter key to full list
-        letter = ex_a
-        full_answer = fewshot_map.get(letter, letter)
-        fewshot_strings.append(
-            f"Q: {ex_q}\n"
-            f"A: The 3 keywords {kw_str} are important to predict that the answer is ({letter}); "
-            f"the full handler list is: {full_answer}."
-        )
-
-    # Optional benchmarking
-    if args.benchmark:
-        logging.info("Running benchmark (evaluate_fs_with_exp)...")
-        df_test = pd.read_csv("fewshot_test.csv")
-        bench = amp.evaluate_fs_with_exp(
-            df_train=df_fewshot,
-            df_test=df_test,
-            model=hf_model,
-            max_new_tokens=1,
-            explainer=captum_map.get(args.explainer, "DeepLift"),
-            idx_list_fs=shot_indices,
-            topk_words=3,
-            split_dict=None
-        )
-        print(bench)
+    # # Optional benchmarking
+    # if args.benchmark:
+    #     amp = self_amplifier(model=hf_model, tokenizer=hf_tokenizer, device=device)
+    #     captum_map = {
+    #         "deeplift": "DeepLift",
+    #         "ig": "LayerIntegratedGradients",
+    #         "grad_act": "LayerGradientXActivation",
+    #         "kernel_shap": "KernelShap",
+    #         "lime": "Lime",
+    #         "shap": "ShapleyValues",
+    #         "shap_s": "ShapleyValueSampling",
+    #         "random": "random"
+    #     }
+    #     logging.info("Running benchmark (evaluate_fs_with_exp)...")
+    #     df_test = pd.read_csv("fewshot_test.csv")
+    #     bench = amp.evaluate_fs_with_exp(
+    #         df_train=df_fewshot,
+    #         df_test=df_test,
+    #         model=hf_model,
+    #         max_new_tokens=1,
+    #         explainer=captum_map.get(args.explainer, "DeepLift"),
+    #         idx_list_fs=shot_indices,
+    #         topk_words=3,
+    #         split_dict=None
+    #     )
+    #     print(bench)
 
     # 8) Construct final prompt for Llama2, embedding Mistral rationales directly
-    prompt = (
-        # (a) System instructions and module context
-        f"System Instructions:\n{GENERAL_CONTEXT}\n\n{module_ctx}\n\n"
-        # (b) Few-Shot Examples and their Mistral rationales
-        "Few-Shot Examples:\n"
-    )
-    # Append each few-shot rationale (which already contains "Q: ... A: ..." lines)
-    for rationale in fewshot_strings:
-        prompt += f"{rationale}\n\n"
-
-    # Continue with retrieved context and conversation
-    prompt += (
-        f"Relevant Context:\n{context_text}\n\n"
-        f"Conversation History:\n{conversation}\n\n"
-        # (c) Finally, the new user question
-        f"User Question:\n{query_text}\n\n"
-        "Please think step by step and explain your reasoning clearly.\n"
-        "Step 1:"
-    )
+    prompt = self_amp.build_prompt(GENERAL_CONTEXT + '\n' + MODULE_CONTEXTS.get(module,''), fewshot_strings, context_text, conversation, query_text, module_ctx)
+    print('prompt', prompt)
 
     # (Optional) Log the prompt size
     token_count = len(prompt.strip().split())
     logging.info(f"   → Prompt length: {token_count} tokens")
 
-    # Invoke Llama-2 for the final answer
-    logging.info("   → Invoking mistral to generate final answer")
-    llama = Ollama(model="mistral:7b")
-    response_text = llama.invoke(prompt)
+    # Invoke Llama-2 for the final answer (modularized)
+    response_text = invoke_model(prompt)
     logging.info("   → mistral final answer generated")
 
-    add_to_history("Assistant", response_text)
+    add_to_history("Assistant", response_text, CURRENT_MODULE, chat_history)
     sources = [d.metadata.get("id") for d, _ in results]
     print(f"Response: {response_text}\nSources: {sources}")
     return response_text
@@ -685,16 +229,16 @@ def main():
     chat_history = load_history() or {}
 
     if args.delete_history:
-        delete_history_entry(args.delete_history)
+        delete_history_entry(args.delete_history, chat_history)
         return
 
     query_text = args.query_text
-    add_to_history("User", query_text)
+    add_to_history("User", query_text, CURRENT_MODULE, chat_history)
     _ = query_rag(query_text, args.module, args=args)
 
     save_input = input("Store this conversation to memory? (y/n): ").strip().lower()
     if save_input.startswith("y"):
-        save_history()
+        save_history(chat_history)
         print("History saved.")
 
 
