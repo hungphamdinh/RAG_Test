@@ -10,7 +10,14 @@ import time
 
 from get_embedding_function import get_embedding_function
 from src.self_amplify.self_amplify import SelfAmplify
+import os, json
 
+# 5) Prepare simplified few-shot DataFrame and mapping by loading from JSON
+_fs_path = os.path.join(os.path.dirname(__file__), "few_shot/tm.json")
+with open(_fs_path, "r") as _fsf:
+    _fs_data = json.load(_fsf)
+df_fewshot  = pd.DataFrame(_fs_data["examples"])
+fewshot_map = _fs_data["fewshot_map"]
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -81,64 +88,6 @@ def query_rag(query_text: str, module: str = None, args=None):
     # 4) Build conversation history for this module
     conversation = self_amp.build_conversation(module)
     module_ctx = MODULE_CONTEXTS.get(module, "")
-
-    # 5) Prepare simplified few-shot DataFrame with letter keys
-    df_fewshot = pd.DataFrame([
-        {"question": "List all API handling functions in the TaskManagement module", "AnswerKey": "A"},
-        # {"question": "List all API handling functions in the Booking module",        "AnswerKey": "B"},
-        # {"question": "List all API handling functions in the Feedback module",       "AnswerKey": "C"},
-        # {"question": "List all API handling functions in the File module",           "AnswerKey": "D"},
-        {"question": "How do I load an existing task’s data when editing?",         "AnswerKey": "E"},
-        {"question": "What’s the default shape of initialValue in TaskDetail?",     "AnswerKey": "F"},
-        {"question": "How is Yup validation configured for the task form?",         "AnswerKey": "G"},
-        {"question": "How does the code update reminders when assignees change?",    "AnswerKey": "H"},
-        {"question": "How do I fetch the task status list?", "AnswerKey": "I"},
-        {"question": "How can I retrieve the priority list for tasks?", "AnswerKey": "J"},
-        {"question": "What does getCurrentTeamList return and when should I use it?", "AnswerKey": "K"},
-        {"question": "How do I get all users across tenants in a team?", "AnswerKey": "L"},
-        {"question": "How do I get teams by tenant with error handling?", "AnswerKey": "M"},
-        {"question": "When should I use getCurrentTeamList rather than getTeamsByTenant?", "AnswerKey": "N"},
-        {"question": "How do I load assignees for a tenant?", "AnswerKey": "O"},
-        {"question": "How do I fetch all users across multiple tenants for a team?", "AnswerKey": "P"},
-        {"question": "How do I retrieve employees by tenant?", "AnswerKey": "Q"},
-        {"question": "How do I reset task detail state?", "AnswerKey": "R"},
-        {"question": "How do I fetch teams specifically for task detail view?", "AnswerKey": "S"},
-        {"question": "How do I fetch tenant list for task detail with pagination?", "AnswerKey": "T"},
-        {"question": "What happens when I tap ‘Add Sub-Task’?",                    "AnswerKey": "I"},
-        {"question": "How are task files uploaded after saving?",                  "AnswerKey": "J"},
-        {"question": "What does transformParams do before submit?",                "AnswerKey": "K"},
-        {"question": "How is the comments modal implemented?",                      "AnswerKey": "L"},
-        {"question": "How does tenant selection reset teams & assignees?",          "AnswerKey": "M"},
-        {"question": "Explain step-by-step what happens on form submit.",            "AnswerKey": "N"},
-    ])
-    fewshot_map = {
-        "A": "getTaskList, getPriorityList, getTeamsByTenant, getCurrentTeamList, getAssigneeList, getUsersInTeamByTenants, getTaskDetail, addTask, updateTask, getStatusList, getMentionUsers, addComment, getCommentByTask, getEmployeesByTenant, getTeamsForTaskDetail, getTenantsTaskDetail",
-        # "B": "getBookingStatus, filterBookings, getAllTimeSlots, getBookingDetail, getPaymentStatus, addBooking, updateBooking, validateRecurringBooking, recurringBooking, getAmenityDetail, getAmenities, getBookingPurpose",
-        # "C": "getListFB, getListQRFeedback, addFB, editFB, editQrFB, detailFB, detailQRFeedback, getSources, getAreas, getCategories, getTypes, getSubCategories, addQuickJR, getQuickJRSetting, getFeedbackStatus, getLocations, getFeedbackDivision, getQrFeedbackSetting",
-        # "D": "downloadAndViewDocument, uploadFiles, deleteFile, downloadImage, getFileReference, getFileByGuid, getFileByReferenceId, getByReferenceIdAndModuleNames, resetFiles",
-        "E": "useEffect(() => { if (isEdit) getTaskDetail(id); return () => resetTaskDetail(); }, [id]);",
-        "F": "const initialValue = { /* default field values */ };",
-        "G": "const validationSchema = Yup.object().shape({ /* shape config */ });",
-        "H": "useEffect(() => { /* sync reminder users */ }, [assignees]);",
-        "I": "useTaskManagement().getStatusList()",
-        "J": "useTaskManagement().getPriorityList()",
-        "K": "useTaskManagement().getCurrentTeamList() - returns the current user’s teams for the TaskManagement module",
-        "L": "useTaskManagement().getUsersInTeamByTenants(params)",
-        "M": "useTaskManagement().getTeamsByTenant(params)",
-        "N": "useTaskManagement().getCurrentTeamList()",
-        "O": "useTaskManagement().getAssigneeList(params)",
-        "P": "useTaskManagement().getUsersInTeamByTenants(params)",
-        "Q": "useTaskManagement().getEmployeesByTenant(params)",
-        "R": "useTaskManagement().resetTaskDetail()",
-        "S": "useTaskManagement().getTeamsForTaskDetail(params)",
-        "T": "useTaskManagement().getTenantsTaskDetail(params)",
-        "I": "const addSubTask = () => { navigation.replace('addSubTask', { /* params */ }); };",
-        "J": "const addTask = async (payload) => { /* create task then upload files */ };",
-        "K": "const params = removeUnnecessaryProperties(transformParams(payload, teamList, id));",
-        "L": "<MessageFloatingButton onPress={() => setVisible(true)} />",
-        "M": "const resetTeamAssignee = (byTeam) => { /* clear fields & refetch */ };",
-        "N": "Validate -> Show signature modal -> Transform params -> Submit request",
-    }
 
     # 6) Select few-shot examples (e.g. those Mistral got wrong)
     logging.info("Step 4/6: Selecting few-shot examples with Mistral-3B")
@@ -244,4 +193,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

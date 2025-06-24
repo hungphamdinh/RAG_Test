@@ -320,6 +320,7 @@ class SelfAmplify:
             selection_strategy=strategy
         )
         if len(idxs) < nb_shot:
+            print('Failed with strategy error -> switch to random')
             idxs = self.generate_context_idx(
                 model=self.hf_model,
                 tokenizer_instance=self.hf_tokenizer,
