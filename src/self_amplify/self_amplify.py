@@ -2,7 +2,7 @@ import json
 import time
 import pandas as pd
 import torch
-from langchain.vectorstores.chroma import Chroma
+from langchain_community.vectorstores import Chroma
 from constant.constant import CHROMA_PATH, RETRIEVAL_METHOD, CONFIG_PATH
 from utils.history_utils import load_history
 from get_embedding_function import get_embedding_function
@@ -13,6 +13,10 @@ import numpy as np
 import logging
 from self_amplifier import self_amplifier
 import torch.nn as nn
+from src.self_amplify.model_singleton import get_hf_tokenizer, get_hf_model
+import torch
+# Singletons for HF tokenizer and model to avoid duplicate loads
+_DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
 logging.basicConfig(
@@ -48,12 +52,11 @@ class SelfAmplify:
         self.rewriter = QueryRewriter("google/flan-t5-small")
         self.ranker   = CrossEncoderRanker("cross-encoder/ms-marco-MiniLM-L-6-v2")
         self.embed_fn = get_embedding_function()
-        self.hf_tokenizer = AutoTokenizer.from_pretrained("ministral/Ministral-3b-instruct")
-        self.hf_model     = AutoModelForCausalLM.from_pretrained(
-            "ministral/Ministral-3b-instruct", low_cpu_mem_usage=True, device_map="auto"
-        )
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        # self.hf_model.to(self.device)
+        # Use shared HF tokenizer and model instances
+        self.hf_tokenizer = get_hf_tokenizer()
+        self.hf_model     = get_hf_model()
+        self.device       = _DEVICE
 
     def preprocess(self, prompt: str, with_bracket: bool = True):
         """

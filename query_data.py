@@ -1,6 +1,5 @@
 import pandas as pd
 import argparse
-from langchain_community.llms.ollama import Ollama
 from utils.query_utils import QueryRewriter, CrossEncoderRanker
 from self_amplifier import self_amplifier
 from constant.constant import CHROMA_PATH, RETRIEVAL_METHOD
@@ -11,6 +10,8 @@ import time
 from get_embedding_function import get_embedding_function
 from src.self_amplify.self_amplify import SelfAmplify
 import os, json
+import threading
+from transformers import TextIteratorStreamer
 
 # 5) Prepare simplified few-shot DataFrame and mapping by loading from JSON
 _fs_path = os.path.join(os.path.dirname(__file__), "few_shot/tm.json")
@@ -24,12 +25,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-_llama_client = None
-def get_llama_client():
-    global _llama_client
-    if _llama_client is None:
-        _llama_client = Ollama(model="mistral:7b")
-    return _llama_client
+
+# Helper to reuse the HuggingFace model and tokenizer from SelfAmplify
+def get_hf_model_and_tokenizer():
+    # Reuse the HF tokenizer and model loaded by SelfAmplify
+    return self_amp.hf_tokenizer, self_amp.hf_model
 
 
 self_amp = SelfAmplify()
@@ -67,8 +67,28 @@ MODULE_CONTEXTS = {
 }
 def invoke_model(prompt: str) -> str:
     logging.info("Step 8/8: Invoking mistral to generate final answer")
-    client = get_llama_client()
-    return client.invoke(prompt)
+    tokenizer, model = get_hf_model_and_tokenizer()
+    # Tokenize inputs
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # Use TextIteratorStreamer for streaming generation
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    generation_kwargs = dict(
+        **inputs,
+        max_new_tokens=512,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+        early_stopping=True,
+        streamer=streamer,
+    )
+    # Launch generation in background thread
+    thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+    # Collect streamed output
+    output_text = ""
+    for new_text in streamer:
+        output_text += new_text
+    thread.join()
+    return output_text.strip()
 
 # ------------------------------------------------------------
 # The main RAG + Self-AMPlIFY pipeline:
@@ -99,33 +119,6 @@ def query_rag(query_text: str, module: str = None, args=None):
     # 7) Generate rationales for each selected example
     logging.info("Step 5/6: Generating rationales with explainer '%s'", args.explainer)
     fewshot_strings = self_amp.generate_few_shot_rationales(df_fewshot, shot_indices, fewshot_map, args)
-
-    # # Optional benchmarking
-    # if args.benchmark:
-    #     amp = self_amplifier(model=hf_model, tokenizer=hf_tokenizer, device=device)
-    #     captum_map = {
-    #         "deeplift": "DeepLift",
-    #         "ig": "LayerIntegratedGradients",
-    #         "grad_act": "LayerGradientXActivation",
-    #         "kernel_shap": "KernelShap",
-    #         "lime": "Lime",
-    #         "shap": "ShapleyValues",
-    #         "shap_s": "ShapleyValueSampling",
-    #         "random": "random"
-    #     }
-    #     logging.info("Running benchmark (evaluate_fs_with_exp)...")
-    #     df_test = pd.read_csv("fewshot_test.csv")
-    #     bench = amp.evaluate_fs_with_exp(
-    #         df_train=df_fewshot,
-    #         df_test=df_test,
-    #         model=hf_model,
-    #         max_new_tokens=1,
-    #         explainer=captum_map.get(args.explainer, "DeepLift"),
-    #         idx_list_fs=shot_indices,
-    #         topk_words=3,
-    #         split_dict=None
-    #     )
-    #     print(bench)
 
     # 8) Construct final prompt for Llama2, embedding Mistral rationales directly
     prompt = self_amp.build_prompt(GENERAL_CONTEXT + '\n' + MODULE_CONTEXTS.get(module,''), fewshot_strings, context_text, conversation, query_text, module_ctx)
