@@ -1,6 +1,6 @@
 import pandas as pd
 import argparse
-from langchain_community.llms.ollama import Ollama
+from llama_cpp import Llama
 from utils.query_utils import QueryRewriter, CrossEncoderRanker
 from self_amplifier import self_amplifier
 from constant.constant import CHROMA_PATH, RETRIEVAL_METHOD
@@ -24,32 +24,15 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-_llama_client = None
 def get_llama_client():
-    global _llama_client
-    if _llama_client is None:
-        _llama_client = Ollama(model="mistral:7b")
-    return _llama_client
+    # Reuse the llama_client already instantiated in the SelfAmplify singleton
+    return self_amp.llama_client
 
 
 self_amp = SelfAmplify()
 CURRENT_MODULE = None
 chat_history   = {}
-GENERAL_CONTEXT = """
-You are a master of React Native and JavaScript, with the expertise of a senior Technical Architect.
-You know every detail of this codebase. Your mission is to assist the user by explaining any part they don’t understand.
-
-- Cite any file and line you reference using “[file.py:42]”.
-- Format all code snippets inside Markdown triple backticks.
-- Do not invent behavior outside the provided context; if unsure, reply “I don’t have enough context to answer that.”
-- Hooks (in the Context folder) define functions that dispatch Redux actions and handle API calls (e.g., useBooking, useTaskManagement).
-- If a function in a Context hook (e.g., useBooking) is wrapped with `withLoadingAndErrorHandling` or `withErrorHandling`, it denotes an API-calling handler.
-- To identify API-handling functions, first inspect `Context/<Module>/Hooks/<useHook>.js` for those wrappers, then check action constants in `Context/<Module>/Actions.js` (e.g., `ADD_TASK`, `UPDATE_TASK`).
-- Reducers (in the Context folder) store and update global state based on dispatched actions.
-- Actions (in the Context folder) define the action type constants used throughout hooks and reducers.
-- Answers should be concise yet complete, providing necessary information without exceeding token limits.
-- For any module, the general flow is: UI screens live under `Screens/<Module>`; API logic resides in hooks under `Context/<Module>/Hooks/<useHook>` (and any hooks those import); action types in `Context/<Module>/Actions.js`; and state updates in `Context/<Module>/Reducers.js`.
-""".strip()
+GENERAL_CONTEXT = ("You are a master of React Native and JavaScript, with the expertise of a senior Technical Architect. You know every detail of this codebase. Your mission is to assist the user by explaining any part they don’t understand.")
 
 MODULE_CONTEXTS = {
     "TaskManagement": """
@@ -66,9 +49,15 @@ MODULE_CONTEXTS = {
     # Add more modules as needed
 }
 def invoke_model(prompt: str) -> str:
-    logging.info("Step 8/8: Invoking mistral to generate final answer")
+    logging.info("Step 8/8: Invoking local llama to generate final answer")
     client = get_llama_client()
-    return client.invoke(prompt)
+    # Use llama_cpp client to generate text with tuned parameters
+    resp = client(
+        prompt,
+        max_tokens=2048,
+        temperature=0.2,
+    )
+    return resp["choices"][0]["text"].strip()
 
 # ------------------------------------------------------------
 # The main RAG + Self-AMPlIFY pipeline:
@@ -100,36 +89,8 @@ def query_rag(query_text: str, module: str = None, args=None):
     logging.info("Step 5/6: Generating rationales with explainer '%s'", args.explainer)
     fewshot_strings = self_amp.generate_few_shot_rationales(df_fewshot, shot_indices, fewshot_map, args)
 
-    # # Optional benchmarking
-    # if args.benchmark:
-    #     amp = self_amplifier(model=hf_model, tokenizer=hf_tokenizer, device=device)
-    #     captum_map = {
-    #         "deeplift": "DeepLift",
-    #         "ig": "LayerIntegratedGradients",
-    #         "grad_act": "LayerGradientXActivation",
-    #         "kernel_shap": "KernelShap",
-    #         "lime": "Lime",
-    #         "shap": "ShapleyValues",
-    #         "shap_s": "ShapleyValueSampling",
-    #         "random": "random"
-    #     }
-    #     logging.info("Running benchmark (evaluate_fs_with_exp)...")
-    #     df_test = pd.read_csv("fewshot_test.csv")
-    #     bench = amp.evaluate_fs_with_exp(
-    #         df_train=df_fewshot,
-    #         df_test=df_test,
-    #         model=hf_model,
-    #         max_new_tokens=1,
-    #         explainer=captum_map.get(args.explainer, "DeepLift"),
-    #         idx_list_fs=shot_indices,
-    #         topk_words=3,
-    #         split_dict=None
-    #     )
-    #     print(bench)
-
     # 8) Construct final prompt for Llama2, embedding Mistral rationales directly
     prompt = self_amp.build_prompt(GENERAL_CONTEXT + '\n' + MODULE_CONTEXTS.get(module,''), fewshot_strings, context_text, conversation, query_text, module_ctx)
-    print('prompt', prompt)
 
     # (Optional) Log the prompt size
     token_count = len(prompt.strip().split())
