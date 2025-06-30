@@ -44,7 +44,7 @@ class SelfAmplify:
         # Instantiate llama_client with local GGUF Q4 model
         from llama_cpp import Llama
         self.llama_client = Llama(
-            model_path="/Volumes/ExtremeSSD/DesktopSSD/AI_Models/models/mistral-7b-instruct-v0.2.Q4_0.gguf",
+            model_path="/Volumes/ExtremeSSD/DesktopSSD/AI_Models/models/mistral-7b-instruct-v0.2.Q5_0.gguf",
             n_ctx=2048,
             n_threads=4,
             use_mlock=True,
